@@ -1,4 +1,3 @@
-
 import javax.swing.*;
 import java.awt.*;
 import java.util.prefs.Preferences;
@@ -16,6 +15,8 @@ import javax.swing.event.*;
 import java.util.regex.*;
 import java.util.Locale;
 
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 
 
 public class PlebHTE {
@@ -25,6 +26,19 @@ public class PlebHTE {
 	private JTextPane notesArea;
     private JCheckBox darkThemeCheck;
     private Path currentFile = null;
+    private final Path notesFolder =
+        Path.of("src").toAbsolutePath().normalize();
+        
+    private boolean isModified = false;
+	private boolean isLoading = false;
+    
+    private Timer highlightTimer;
+
+	private int dirtyStart = Integer.MAX_VALUE;
+	private int dirtyEnd = -1;
+
+	private static final Pattern LINK_PATTERN =
+    Pattern.compile("\\[\\[([^\\[\\]\\r\\n]+)\\]\\]");
 
 // Постоянное хранилище настроек
 
@@ -42,8 +56,21 @@ public class PlebHTE {
         window = new JFrame("Мои заметки");
         window.setSize(800, 600);
         window.setMinimumSize(new Dimension(800, 600));
-        window.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+		window.setDefaultCloseOperation(
+			JFrame.DO_NOTHING_ON_CLOSE
+		);
         window.setLocationRelativeTo(null);
+        
+        window.addWindowListener(new WindowAdapter() {
+		@Override
+		public void windowClosing(WindowEvent e) {
+
+				if (confirmSaveChanges()) {
+					saveSettings();
+					window.dispose();
+				}
+			}
+		});
 
         JPanel panel = new JPanel(new BorderLayout(10, 10));
         panel.setBorder(BorderFactory.createEmptyBorder(
@@ -63,34 +90,59 @@ public class PlebHTE {
 
         notesArea = new JTextPane();
         
-        
+// Таймер для записи [[]], чтобы не обновлять постоянно
+
+		highlightTimer = new Timer(100, e -> {
+			if (dirtyStart != Integer.MAX_VALUE) {
+				highlightChangedLines(dirtyStart, dirtyEnd);
+			}
+
+			dirtyStart = Integer.MAX_VALUE;
+			dirtyEnd = -1;
+		});
+
+		highlightTimer.setRepeats(false);
+
 		notesArea.getDocument().addDocumentListener(
 			new DocumentListener() {
 
-				private void update() {
-					SwingUtilities.invokeLater(
-						() -> highlightLinks()
-					);
+				private void scheduleUpdate(int start, int end) {
+					dirtyStart = Math.min(dirtyStart, start);
+					dirtyEnd = Math.max(dirtyEnd, end);
+
+// Перезапускаем таймер
+
+					highlightTimer.restart();
 				}
 
-				@Override
-				public void insertUpdate(DocumentEvent e) {
-					update();
-				}
+			@Override
+			public void insertUpdate(DocumentEvent e) {
+				scheduleUpdate(
+					e.getOffset(),
+					e.getOffset() + e.getLength()
+				);
 
-				@Override
-				public void removeUpdate(DocumentEvent e) {
-					update();
-				}
+				markModified();
+			}
 
-				@Override
-				public void changedUpdate(DocumentEvent e) {
+			@Override
+			public void removeUpdate(DocumentEvent e) {
+				scheduleUpdate(
+					e.getOffset(),
+					e.getOffset()
+				);
 
-// Изменилось оформление, не сам текст
+				markModified();
+			}
 
-				}
+			@Override
+			public void changedUpdate(DocumentEvent e) {
+				// Изменение оформления не считаем
+				// изменением содержимого документа
+			}
 			}
 		);
+
 
         
 		notesArea.addMouseListener(new MouseAdapter() {
@@ -180,6 +232,21 @@ public class PlebHTE {
         });
 
         window.setContentPane(panel);
+        
+// Проверяем директории
+        
+        try {
+			Files.createDirectories(notesFolder);
+		} catch (IOException e) {
+			JOptionPane.showMessageDialog(
+				window,
+				"Не удалось создать папку заметок:\n"
+					+ e.getMessage(),
+				"Ошибка",
+				JOptionPane.ERROR_MESSAGE
+			);
+			return;
+		}
 
 // Загружаем настройки
 
@@ -188,25 +255,51 @@ public class PlebHTE {
         window.setVisible(true);
     }
     
-	private void saveToFile() {
+    private void setDocumentText(String text) {
+
+		isLoading = true;
+
+		try {
+			notesArea.setText(text);
+		} finally {
+			isLoading = false;
+		}
+
+		isModified = false;
+		updateTitle();
+
+// Синхронизируем подсветку после загрузки
+
+		if (highlightTimer != null) {
+			highlightTimer.stop();
+		}
+
+		dirtyStart = Integer.MAX_VALUE;
+		dirtyEnd = -1;
+
+		highlightLinks();
+	}
+    
+	private boolean saveToFile() {
 
 		Path file;
 
+		String name = nameField.getText()
+			.trim()
+			.toLowerCase(Locale.ROOT);
+
+		String newFileName = name.endsWith(".txt")
+			? name
+			: name + ".txt";
+
 		if (currentFile != null &&
-			currentFile.getFileName().toString()
-					.equals(nameField.getText() + ".txt"))  {
-						
-// Если файл уже открыт и имя совпадает, сохраняем в него
-			
+				currentFile.getFileName().toString()
+					.equals(newFileName)) {
 			file = currentFile;
-						
 		} else {
 			
 // Если файл ещё не открыт или имя поменялось, используем новое имя
 
-			String name = nameField.getText()
-					.trim()
-					.toLowerCase(Locale.ROOT);
 
 			if (name.isEmpty() || name.contains("/") ||
 					name.contains("\\") ||
@@ -215,10 +308,9 @@ public class PlebHTE {
 				JOptionPane.showMessageDialog(
 					window, "Введите корректное имя файла!"
 				);
-				return;
+				return false;
 			}
 
-			String newFileName = name + ".txt";
 
 			if (currentFile != null) {
 
@@ -230,7 +322,7 @@ public class PlebHTE {
 
 // Первый файл — в рабочую папку
 				
-				file = Path.of(newFileName);
+				file = notesFolder.resolve(newFileName);
 			}
 
 // Если это другой файл, проверяем перезапись
@@ -249,7 +341,7 @@ public class PlebHTE {
 				);
 
 				if (confirm != JOptionPane.YES_OPTION) {
-					return;
+					return false;
 				}
 			}
 
@@ -266,8 +358,10 @@ public class PlebHTE {
 			);
 			
 			saveSettings();
-			currentFile = file;
+			isModified = false;
 			updateTitle();
+			return true;
+						
 
 		} catch (IOException e) {
 			JOptionPane.showMessageDialog(
@@ -276,12 +370,14 @@ public class PlebHTE {
 				"Ошибка",
 				JOptionPane.ERROR_MESSAGE
 			);
+			return false;
 		}
 	}
 
-	private void saveAsFile() {
+	private boolean saveAsFile() {
 
-		JFileChooser chooser = new JFileChooser();
+		JFileChooser chooser =
+			new JFileChooser(notesFolder.toFile());
 
 // Предлагаем имя текущего файла
 		
@@ -330,7 +426,7 @@ public class PlebHTE {
 				);
 
 				if (confirm != JOptionPane.YES_OPTION) {
-					return;
+					return false;
 				}
 			}
 
@@ -344,8 +440,13 @@ public class PlebHTE {
 					"Файл успешно сохранён!"
 				);
 				currentFile = file;
+				isModified = false;
 				updateTitle();
 				saveSettings();
+				
+
+
+				return true;
 
 			} catch (IOException e) {
 				JOptionPane.showMessageDialog(
@@ -354,8 +455,11 @@ public class PlebHTE {
 					"Ошибка",
 					JOptionPane.ERROR_MESSAGE
 				);
+				return false;
 			}
 		}
+		
+		return false;
 	}
 
 
@@ -395,7 +499,7 @@ public class PlebHTE {
 				if (Files.isRegularFile(file)) {
 					String text = Files.readString(file);
 
-					notesArea.setText(text);
+					setDocumentText(text);
 					currentFile = file;
 
 					String fileName = file.getFileName().toString();
@@ -421,20 +525,62 @@ public class PlebHTE {
 		}
 	}
 	
+	private boolean createLinkedDocument(Path file) {
+
+		int choice = JOptionPane.showConfirmDialog(
+			window,
+			"Документ не найден:\n" +
+			file.getFileName() +
+			"\n\nСоздать новый документ?",
+			"Новая заметка",
+			JOptionPane.YES_NO_OPTION,
+			JOptionPane.QUESTION_MESSAGE
+		);
+
+		if (choice != JOptionPane.YES_OPTION) {
+			return false;
+		}
+
+		try {
+			// Создаём пустой файл, не перезаписывая существующий
+			Files.createFile(file);
+			return true;
+
+		} catch (java.nio.file.FileAlreadyExistsException e) {
+			// Файл появился после проверки — используем его
+			return Files.isRegularFile(file);
+
+		} catch (IOException e) {
+			JOptionPane.showMessageDialog(
+				window,
+				"Ошибка создания файла:\n" + e.getMessage(),
+				"Ошибка",
+				JOptionPane.ERROR_MESSAGE
+			);
+			return false;
+		}
+	}
+	
 	private void openFile() {
 
-		JFileChooser chooser = new JFileChooser();
+		JFileChooser chooser = new JFileChooser(notesFolder.toFile());
 
 		int result = chooser.showOpenDialog(window);
 
 		if (result == JFileChooser.APPROVE_OPTION) {
 
 			Path file = chooser.getSelectedFile().toPath();
+			
+			if (!confirmSaveChanges()) {
+				return;
+			}
 
 			try {
+				
+				
 				String text = Files.readString(file);
 
-				notesArea.setText(text);
+				setDocumentText(text);
 				currentFile = file;
 
 				JOptionPane.showMessageDialog(
@@ -453,7 +599,7 @@ public class PlebHTE {
 				}
 
 				nameField.setText(fileName);
-
+				saveSettings();
 				updateTitle();
 				
 			} catch (IOException e) {
@@ -469,13 +615,19 @@ public class PlebHTE {
 
 	private void updateTitle() {
 
+		String title = "PlebHTE — ";
+
 		if (currentFile == null) {
-			window.setTitle("Мои заметки — Новый документ");
+			title += "Новый документ";
 		} else {
-			window.setTitle(
-				"Мои заметки — " + currentFile.getFileName()
-			);
+			title += currentFile.getFileName();
 		}
+
+		if (isModified) {
+			title += " *";
+		}
+
+		window.setTitle(title);
 	}
 	
 	private void openLinkAt(int position) {
@@ -532,40 +684,35 @@ public class PlebHTE {
 
 // Ищем ссылку рядом с текущим документом
 		
-		Path folder = currentFile != null
-				? currentFile.toAbsolutePath().getParent()
-				: Path.of("").toAbsolutePath();
+		Path target = notesFolder.resolve(fileName);
 
-		Path target = folder.resolve(fileName);
 
 		if (!Files.isRegularFile(target)) {
-			JOptionPane.showMessageDialog(
-				window,
-				"Документ не найден:\n" + target
-			);
-			return;
-		}
 
-// Пока спрашиваем перед заменой текущего текста.
-// Позже заменим это проверкой изменений.
-		
-		int confirm = JOptionPane.showConfirmDialog(
-			window,
-			"Открыть " + fileName +
-			"?\nУбедись, что текущие изменения сохранены.",
-			"Переход по ссылке",
-			JOptionPane.OK_CANCEL_OPTION
-		);
+			// Если путь уже занят папкой или другим объектом
+			if (Files.exists(target)) {
+				JOptionPane.showMessageDialog(
+					window,
+					"По этому пути находится не обычный файл!"
+				);
+				return;
+			}
 
-		if (confirm != JOptionPane.OK_OPTION) {
-			return;
+			// Предлагаем создать документ
+			if (!createLinkedDocument(target)) {
+				return;
+			}
 		}
 
 		try {
 			String content = Files.readString(target);
 
-			notesArea.setText(content);
+			if (!confirmSaveChanges()) {
+				return;
+			}
+
 			currentFile = target;
+			setDocumentText(content);
 
 // Отображаем имя без расширения
 			
@@ -581,6 +728,7 @@ public class PlebHTE {
 
 			nameField.setText(displayName);
 			updateTitle();
+			saveSettings();
 
 		} catch (IOException e) {
 			JOptionPane.showMessageDialog(
@@ -592,51 +740,143 @@ public class PlebHTE {
 		}
 	}
 	
+	private boolean confirmSaveChanges() {
+
+		// Если ничего не изменялось,
+		// можно продолжать без вопросов
+		if (!isModified) {
+			return true;
+		}
+
+		String fileName = currentFile == null
+				? "Новый документ"
+				: currentFile.getFileName().toString();
+
+		Object[] options = {
+			"Сохранить",
+			"Не сохранять",
+			"Отмена"
+		};
+
+		int choice = JOptionPane.showOptionDialog(
+			window,
+			"В документе \"" + fileName +
+			"\" есть несохранённые изменения.\n" +
+			"Сохранить перед продолжением?",
+			"Несохранённые изменения",
+			JOptionPane.DEFAULT_OPTION,
+			JOptionPane.WARNING_MESSAGE,
+			null,
+			options,
+			options[0]
+		);
+
+		if (choice == 0) {
+			// Сохранить и продолжить,
+			// только если запись успешна
+			return saveToFile();
+		}
+
+		if (choice == 1) {
+			// Продолжить без сохранения
+			return true;
+		}
+
+		// Отмена или закрытие диалога
+		return false;
+	}
 	
-	private void highlightLinks() {
+	
+	private void highlightChangedLines(int start, int end) {
 
 		StyledDocument doc = notesArea.getStyledDocument();
-		String text = notesArea.getText();
+		int length = doc.getLength();
 
-// Обычный стиль
-		
+		if (length == 0) {
+			return;
+		}
+
+		// Не позволяем выйти за границы документа
+		start = Math.max(0, Math.min(start, length));
+		end = Math.max(start, Math.min(end, length));
+
+		// Находим логические строки изменённого участка
+		Element root = doc.getDefaultRootElement();
+
+		int firstLine = root.getElementIndex(start);
+		int lastLine = root.getElementIndex(end);
+
+		int from = root.getElement(firstLine).getStartOffset();
+		int to = Math.min(
+			root.getElement(lastLine).getEndOffset(),
+			length
+		);
+
+		// Читаем только нужный фрагмент
+		String text;
+
+		try {
+			text = doc.getText(from, to - from);
+		} catch (BadLocationException e) {
+			return;
+		}
+
+		// Стиль обычного текста
 		SimpleAttributeSet normal = new SimpleAttributeSet();
-		StyleConstants.setForeground(normal,
+
+		StyleConstants.setForeground(
+			normal,
 			darkThemeCheck.isSelected()
-				? Color.WHITE : Color.BLACK);
+				? Color.WHITE : Color.BLACK
+		);
+
 		StyleConstants.setUnderline(normal, false);
 
-// Стиль гиперссылки
-
+		// Стиль ссылки
 		SimpleAttributeSet link = new SimpleAttributeSet();
-		StyleConstants.setForeground(link, new Color(65, 145, 245));
+
+		StyleConstants.setForeground(
+			link, new Color(65, 145, 245)
+		);
+
 		StyleConstants.setUnderline(link, true);
 
-// Сначала убираем старую подсветку
-
+		// Сбрасываем подсветку только нужных строк
 		doc.setCharacterAttributes(
-			0, doc.getLength(), normal, true
+			from, to - from, normal, false
 		);
 
-// Находим конструкции [[Название]]
-		
-		Pattern pattern = Pattern.compile(
-			"\\[\\[([^\\[\\]\\r\\n]+)\\]\\]"
-		);
-
-		Matcher matcher = pattern.matcher(text);
+		Matcher matcher = LINK_PATTERN.matcher(text);
 
 		while (matcher.find()) {
 			doc.setCharacterAttributes(
-				matcher.start(),
+				from + matcher.start(),
 				matcher.end() - matcher.start(),
 				link,
-				true
+				false
 			);
 		}
 	}
 
 
+	private void highlightLinks() {
+		highlightChangedLines(
+			0,
+			notesArea.getDocument().getLength()
+		);
+	}
+	
+	private void markModified() {
+
+		if (isLoading) {
+			return;
+		}
+
+		if (!isModified) {
+			isModified = true;
+			updateTitle();
+		}
+	}
 
 
     private void applyTheme(boolean dark) {
@@ -661,6 +901,7 @@ public class PlebHTE {
         notesArea.setCaretColor(foreground);
 
         root.repaint();
+        highlightLinks();
     }
 
     private void applyColors(
