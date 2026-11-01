@@ -1,871 +1,276 @@
 import javax.swing.*;
-import java.awt.*;
-import java.util.prefs.Preferences;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.io.IOException;
-
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import java.util.regex.Pattern;
-import java.util.regex.Matcher;
-
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.html.HTMLDocument;
+import javax.swing.text.html.HTMLEditorKit;
 import javax.swing.text.*;
-import javax.swing.event.*;
-import java.util.regex.*;
-import java.util.Locale;
+import javax.swing.text.Highlighter;
+import javax.swing.text.DefaultHighlighter;
 
-import java.awt.event.WindowAdapter;
-import java.awt.event.WindowEvent;
+import java.awt.*;
+import java.awt.event.*;
+
+import java.io.IOException;
+import java.io.StringWriter;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.prefs.Preferences;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 
 public class PlebHTE {
+	
+	// Our [[link]] pattern
+    private static final Pattern LINK_PATTERN =
+            Pattern.compile("\\[\\[([^\\[\\]\\r\\n]+)\\]\\]");
+    private static final String EMPTY_HTML = "<html><body><p></p></body></html>";
+
+    private final Path notesFolder = Path.of("notes").toAbsolutePath().normalize(); // Working with [notes] folder
+    private final Preferences prefs = Preferences.userNodeForPackage(PlebHTE.class); // Local preferences saves
 
     private JFrame window;
     private JTextField nameField;
-	private JTextPane notesArea;
+    private JTextPane notesArea;
     private JCheckBox darkThemeCheck;
-    private Path currentFile = null;
-    private final Path notesFolder =
-        Path.of("src").toAbsolutePath().normalize();
-        
-    private boolean isModified = false;
-	private boolean isLoading = false;
+    private Path currentFile;
     
-    private Timer highlightTimer;
+    private final List<Object> wikiHighlights =
+		new ArrayList<>();
 
-	private int dirtyStart = Integer.MAX_VALUE;
-	private int dirtyEnd = -1;
-
-	private static final Pattern LINK_PATTERN =
-    Pattern.compile("\\[\\[([^\\[\\]\\r\\n]+)\\]\\]");
-
-// Постоянное хранилище настроек
-
-    private final Preferences prefs =
-            Preferences.userNodeForPackage(PlebHTE.class);
+	private final Highlighter.HighlightPainter wikiPainter =
+		new DefaultHighlighter.DefaultHighlightPainter(
+			new Color(215, 230, 255)
+		);
+    
+    private boolean isModified;
+    private boolean isLoading;
 
     public static void main(String[] args) {
-        SwingUtilities.invokeLater(() -> new PlebHTE().createUI());
+        SwingUtilities.invokeLater(() -> new PlebHTE().createUI()); // Loading at the end
     }
 
     private void createUI() {
-
-// Данные окна и приложения
-
-        window = new JFrame("Мои заметки");
+        window = new JFrame("PlebHTE");
         window.setSize(800, 600);
-        window.setMinimumSize(new Dimension(800, 600));
-		window.setDefaultCloseOperation(
-			JFrame.DO_NOTHING_ON_CLOSE
-		);
+        window.setMinimumSize(new Dimension(550, 400));
         window.setLocationRelativeTo(null);
-        
+        window.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         window.addWindowListener(new WindowAdapter() {
-		@Override
-		public void windowClosing(WindowEvent e) {
+            @Override
+            public void windowClosing(WindowEvent e) { 
+                if (confirmSaveChanges()) { 
+                    saveSettings();
+                    window.dispose(); // Asking to save document before closing if changed
+                }
+            }
+        });
 
-				if (confirmSaveChanges()) {
-					saveSettings();
-					window.dispose();
-				}
-			}
-		});
-
-        JPanel panel = new JPanel(new BorderLayout(10, 10));
-        panel.setBorder(BorderFactory.createEmptyBorder(
-                15, 15, 15, 15));
-
-// Верхняя панель
-
-        JPanel topPanel = new JPanel(new BorderLayout(10, 10));
-
+        JPanel panel = new JPanel(new BorderLayout(10, 10)); 
+        panel.setBorder(BorderFactory.createEmptyBorder(15, 15, 15, 15));
+        
+//Top panel
+        JPanel top = new JPanel(new BorderLayout(10, 10)); 
         nameField = new JTextField();
-        topPanel.add(new JLabel("Note name:"), BorderLayout.WEST);
-        topPanel.add(nameField, BorderLayout.CENTER);
+        
+        top.add(new JLabel("Note name:"), BorderLayout.WEST);
+        top.add(nameField, BorderLayout.CENTER);
+        JPanel header = new JPanel(new BorderLayout(0, 8));
 
-        panel.add(topPanel, BorderLayout.NORTH);
+		header.add(top, BorderLayout.NORTH);
+		header.add(
+			createFormattingToolbar(),
+			BorderLayout.SOUTH
+		);
 
-// Основное поле заметок
+		panel.add(header, BorderLayout.NORTH);
 
         notesArea = new JTextPane();
+        notesArea.setContentType("text/html");
+        setupFormattingShortcuts();
         
-// Таймер для записи [[]], чтобы не обновлять постоянно
+        Timer wikiTimer = new Timer(150, e -> highlightWikiLinks()); // Timer for updating link hilights
+		wikiTimer.setRepeats(false);
 
-		highlightTimer = new Timer(100, e -> {
-			if (dirtyStart != Integer.MAX_VALUE) {
-				highlightChangedLines(dirtyStart, dirtyEnd);
-			}
+        notesArea.getDocument().addDocumentListener(new DocumentListener() {
+            @Override public void insertUpdate(DocumentEvent e) { markModified(); if (!isLoading) wikiTimer.restart(); }
+            @Override public void removeUpdate(DocumentEvent e) { markModified(); if (!isLoading) wikiTimer.restart(); }
+            @Override public void changedUpdate(DocumentEvent e) { markModified();}
+        });
+        notesArea.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (SwingUtilities.isLeftMouseButton(e) && e.getClickCount() == 1) {
+                    int offset = notesArea.viewToModel2D(e.getPoint());
+                    if (offset >= 0) openLinkAt(offset);
+                }
+            }
+        });
+        panel.add(new JScrollPane(notesArea), BorderLayout.CENTER);
 
-			dirtyStart = Integer.MAX_VALUE;
-			dirtyEnd = -1;
-		});
+        JButton saveButton = new JButton("Save");
+        JButton loadButton = new JButton("Load");
+        JButton saveAsButton = new JButton("Save as...");
+        darkThemeCheck = new JCheckBox("Dark mode");
 
-		highlightTimer.setRepeats(false);
-
-		notesArea.getDocument().addDocumentListener(
-			new DocumentListener() {
-
-				private void scheduleUpdate(int start, int end) {
-					dirtyStart = Math.min(dirtyStart, start);
-					dirtyEnd = Math.max(dirtyEnd, end);
-
-// Перезапускаем таймер
-
-					highlightTimer.restart();
-				}
-
-			@Override
-			public void insertUpdate(DocumentEvent e) {
-				scheduleUpdate(
-					e.getOffset(),
-					e.getOffset() + e.getLength()
-				);
-
-				markModified();
-			}
-
-			@Override
-			public void removeUpdate(DocumentEvent e) {
-				scheduleUpdate(
-					e.getOffset(),
-					e.getOffset()
-				);
-
-				markModified();
-			}
-
-			@Override
-			public void changedUpdate(DocumentEvent e) {
-				// Изменение оформления не считаем
-				// изменением содержимого документа
-			}
-			}
-		);
-
-
-        
-		notesArea.addMouseListener(new MouseAdapter() {
-
-			@Override
-			public void mouseClicked(MouseEvent e) {
-
-				if (e.getButton() == MouseEvent.BUTTON1 &&
-					e.getClickCount() == 1) {
-
-					int position = notesArea.viewToModel2D(
-						e.getPoint()
-					);
-
-					if (position >= 0) {
-						openLinkAt(position);
-					}
-				}
-			}
-		});
-
-
-        JScrollPane scrollPane = new JScrollPane(notesArea);
-        panel.add(scrollPane, BorderLayout.CENTER);
-
-// Нижняя панель
-        
-        JPanel bottomPanel = new JPanel(
-                new FlowLayout(FlowLayout.CENTER, 10, 5));
-
-        JButton saveButton = new JButton("Сохранить");
-        JButton loadButton = new JButton("Загрузка");
-        JButton clearButton = new JButton("Очистить");
-		JButton saveAsButton = new JButton("Сохранить как...");
-        darkThemeCheck = new JCheckBox("Тёмная тема");
-
-        bottomPanel.add(saveButton);
-		bottomPanel.add(loadButton);
-        // bottomPanel.add(clearButton);
-		bottomPanel.add(saveAsButton);
-        bottomPanel.add(darkThemeCheck);
-
-        panel.add(bottomPanel, BorderLayout.SOUTH);
-
-// Обработчики кнопок
+        JPanel bottom = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 5));
+        bottom.add(saveButton);
+        bottom.add(loadButton);
+        bottom.add(saveAsButton);
+        bottom.add(darkThemeCheck);
+        panel.add(bottom, BorderLayout.SOUTH);
+        window.setContentPane(panel);
 
         saveButton.addActionListener(e -> saveToFile());
+        loadButton.addActionListener(e -> openFile());
         saveAsButton.addActionListener(e -> saveAsFile());
-        
-        saveButton.getInputMap(
-			JComponent.WHEN_IN_FOCUSED_WINDOW
-			).put(
-				KeyStroke.getKeyStroke("F5"),
-				"quickSave"
-			);
-			
-		saveButton.getInputMap(
-			JComponent.WHEN_IN_FOCUSED_WINDOW
-				).put(
-				KeyStroke.getKeyStroke("control S"),
-			"quickSave"
-		);
-
-		saveButton.getActionMap().put(
-			"quickSave",
-			new AbstractAction() {
-				@Override
-				public void actionPerformed(java.awt.event.ActionEvent e) {
-					saveButton.doClick();
-				}
-			}
-		);
-		
-
-
-        clearButton.addActionListener(e -> {
-            notesArea.setText("");
-        });
-
-	loadButton.addActionListener(e -> openFile());	
-
-
         darkThemeCheck.addActionListener(e -> {
             applyTheme(darkThemeCheck.isSelected());
-            prefs.putBoolean(
-                    "darkTheme", darkThemeCheck.isSelected());
+            prefs.putBoolean("darkTheme", darkThemeCheck.isSelected());
         });
 
-        window.setContentPane(panel);
-        
-// Проверяем директории
-        
-        try {
-			Files.createDirectories(notesFolder);
-		} catch (IOException e) {
-			JOptionPane.showMessageDialog(
-				window,
-				"Не удалось создать папку заметок:\n"
-					+ e.getMessage(),
-				"Ошибка",
-				JOptionPane.ERROR_MESSAGE
-			);
-			return;
-		}
+        JRootPane root = window.getRootPane();
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                .put(KeyStroke.getKeyStroke("F5"), "quickSave");
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                .put(KeyStroke.getKeyStroke("control S"), "quickSave");
+        root.getActionMap().put("quickSave", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) { saveButton.doClick(); }
+        });
 
-// Загружаем настройки
+        try {
+            Files.createDirectories(notesFolder);
+        } catch (IOException e) {
+            showError("Cannot create notes folder", e);
+            window.dispose();
+            return;
+        }
 
         loadSettings();
-		updateTitle();
+        updateTitle();
         window.setVisible(true);
     }
     
-    private void setDocumentText(String text) {
+    private JToolBar createFormattingToolbar() {
 
+		JToolBar toolbar = new JToolBar();
+		toolbar.setFloatable(false);
+
+		// Bold
+		JButton bold = new JButton("B");
+		bold.setFont(bold.getFont().deriveFont(Font.BOLD));
+		bold.setToolTipText("Bold");
+
+		// Italic
+		JButton italic = new JButton("I");
+		italic.setFont(italic.getFont().deriveFont(Font.ITALIC));
+		italic.setToolTipText("Italic");
+
+		// Underline
+		JButton underline = new JButton("U");
+		underline.setToolTipText("Underline");
+
+		toolbar.add(bold);
+		toolbar.add(italic);
+		toolbar.add(underline);
+
+		toolbar.addSeparator();
+
+		// Text size
+		JComboBox<String> fontSize = new JComboBox<>(
+			new String[]{"8","10","12","14","18","24","32"}
+		);
+
+		fontSize.setSelectedItem("12");
+		fontSize.setMaximumSize(new Dimension(65, 28));
+		fontSize.setToolTipText("Size of HTML text");
+
+		toolbar.add(new JLabel(" Size: "));
+		toolbar.add(fontSize);
+
+		toolbar.addSeparator();
+
+		// Text color
+		JButton colorButton = new JButton("Color");
+		colorButton.setToolTipText("Color of HTML text");
+
+		toolbar.add(colorButton);
+
+		bold.addActionListener(e ->
+			applyHtmlAction(new HTMLEditorKit.BoldAction())
+		);
+
+		italic.addActionListener(e ->
+			applyHtmlAction(new HTMLEditorKit.ItalicAction())
+		);
+
+		underline.addActionListener(e ->
+			applyHtmlAction(new HTMLEditorKit.UnderlineAction())
+		);
+
+		fontSize.addActionListener(e -> {
+
+			int size = Integer.parseInt(
+				(String) fontSize.getSelectedItem()
+			);
+
+			applyHtmlAction(
+				new HTMLEditorKit.FontSizeAction(
+					"Font size", size
+				)
+			);
+		});
+
+		colorButton.addActionListener(e -> {
+
+			Color selected = JColorChooser.showDialog(
+				window,
+				"Chose text color",
+				Color.BLACK
+			);
+
+			if (selected != null) {
+				applyHtmlAction(
+					new HTMLEditorKit.ForegroundAction(
+						"Text color", selected
+					)
+				);
+			}
+		});
+		return toolbar;
+	}
+
+    // Only way to change a text
+	private void setDocumentText(String html) {
 		isLoading = true;
-
 		try {
-			notesArea.setText(text);
-		} finally {
-			isLoading = false;
-		}
-
-		isModified = false;
-		updateTitle();
-
-// Синхронизируем подсветку после загрузки
-
-		if (highlightTimer != null) {
-			highlightTimer.stop();
-		}
-
-		dirtyStart = Integer.MAX_VALUE;
-		dirtyEnd = -1;
-
-		highlightLinks();
-	}
-    
-	private boolean saveToFile() {
-
-		Path file;
-
-		String name = nameField.getText()
-			.trim()
-			.toLowerCase(Locale.ROOT);
-
-		String newFileName = name.endsWith(".txt")
-			? name
-			: name + ".txt";
-
-		if (currentFile != null &&
-				currentFile.getFileName().toString()
-					.equals(newFileName)) {
-			file = currentFile;
-		} else {
-			
-// Если файл ещё не открыт или имя поменялось, используем новое имя
-
-
-			if (name.isEmpty() || name.contains("/") ||
-					name.contains("\\") ||
-					name.equals(".") || name.equals("..")) {
-
-				JOptionPane.showMessageDialog(
-					window, "Введите корректное имя файла!"
-				);
-				return false;
-			}
-
-
-			if (currentFile != null) {
-
-// Сохраняем в папку текущего документа
-				
-				file = currentFile.resolveSibling(newFileName);
-
-			} else {
-
-// Первый файл — в рабочую папку
-				
-				file = notesFolder.resolve(newFileName);
-			}
-
-// Если это другой файл, проверяем перезапись
-			
-			if (!file.toAbsolutePath().normalize().equals(
-					currentFile == null
-						? null
-						: currentFile.toAbsolutePath().normalize()
-				) && Files.exists(file)) {
-
-				int confirm = JOptionPane.showConfirmDialog(
-					window,
-					"Файл уже существует. Перезаписать?",
-					"Подтверждение",
-					JOptionPane.YES_NO_OPTION
-				);
-
-				if (confirm != JOptionPane.YES_OPTION) {
-					return false;
-				}
-			}
-
-		}
-
-		try {
-			Files.writeString(file, notesArea.getText());
-
-			currentFile = file;
-
-			JOptionPane.showMessageDialog(
-				window,
-				"Файл сохранён:\n" + file.toAbsolutePath()
-			);
-			
-			saveSettings();
+			notesArea.setText(html);
+			highlightWikiLinks();
 			isModified = false;
-			updateTitle();
-			return true;
-						
+		} finally {	isLoading = false; }
 
-		} catch (IOException e) {
-			JOptionPane.showMessageDialog(
-				window,
-				"Ошибка сохранения: " + e.getMessage(),
-				"Ошибка",
-				JOptionPane.ERROR_MESSAGE
-			);
-			return false;
-		}
-	}
-
-	private boolean saveAsFile() {
-
-		JFileChooser chooser =
-			new JFileChooser(notesFolder.toFile());
-
-// Предлагаем имя текущего файла
-		
-		if (currentFile != null) {
-			chooser.setSelectedFile(currentFile.toFile());
-		} else {
-			String name = nameField.getText().trim();
-
-			if (name.isEmpty()) {
-				name = "notes";
-			}
-
-			chooser.setSelectedFile(
-				new java.io.File(name + ".txt")
-			);
-		}
-
-		int result = chooser.showSaveDialog(window);
-
-		if (result == JFileChooser.APPROVE_OPTION) {
-
-			Path file = chooser.getSelectedFile().toPath();
-			
-			file = file.resolveSibling(
-				file.getFileName().toString()
-					.toLowerCase(Locale.ROOT)
-			);
-
-// Добавляем расширение, если его нет
-			
-			if (!file.getFileName().toString()
-					 .toLowerCase(java.util.Locale.ROOT)
-					 .endsWith(".txt")) {
-				file = Path.of(file.toString() + ".txt");
-			}
-
-// Предупреждаем о перезаписи
-			
-			if (Files.exists(file)) {
-
-				int confirm = JOptionPane.showConfirmDialog(
-					window,
-					"Файл уже существует. Перезаписать?",
-					"Подтверждение",
-					JOptionPane.YES_NO_OPTION
-				);
-
-				if (confirm != JOptionPane.YES_OPTION) {
-					return false;
-				}
-			}
-
-			try {
-				Files.writeString(file, notesArea.getText());
-
-				currentFile = file;
-
-				JOptionPane.showMessageDialog(
-					window,
-					"Файл успешно сохранён!"
-				);
-				currentFile = file;
-				isModified = false;
-				updateTitle();
-				saveSettings();
-				
-
-
-				return true;
-
-			} catch (IOException e) {
-				JOptionPane.showMessageDialog(
-					window,
-					"Ошибка сохранения: " + e.getMessage(),
-					"Ошибка",
-					JOptionPane.ERROR_MESSAGE
-				);
-				return false;
-			}
-		}
-		
-		return false;
-	}
-
-
-	private void saveSettings() {
-
-		prefs.put("name", nameField.getText());
-
-		prefs.putBoolean(
-			"darkTheme",
-			darkThemeCheck.isSelected()
-		);
-
-		if (currentFile != null) {
-			prefs.put(
-				"lastFile",
-				currentFile.toAbsolutePath().toString()
-			);
-		}
-	}
-
-
-	private void loadSettings() {
-
-		nameField.setText(prefs.get("name", ""));
-
-		boolean dark = prefs.getBoolean("darkTheme", false);
-		darkThemeCheck.setSelected(dark);
-		applyTheme(dark);
-
-		String lastFile = prefs.get("lastFile", "");
-
-		if (!lastFile.isEmpty()) {
-
-			try {
-				Path file = Path.of(lastFile);
-
-				if (Files.isRegularFile(file)) {
-					String text = Files.readString(file);
-
-					setDocumentText(text);
-					currentFile = file;
-
-					String fileName = file.getFileName().toString();
-
-					if (fileName.toLowerCase(Locale.ROOT)
-							.endsWith(".txt")) {
-						fileName = fileName.substring(
-							0, fileName.length() - 4
-						);
-					}
-
-					nameField.setText(fileName);
-					updateTitle();
-				}
-
-			} catch (IOException | java.nio.file.InvalidPathException e) {
-				JOptionPane.showMessageDialog(
-					window,
-					"Не удалось открыть предыдущий документ:\n"
-						+ e.getMessage()
-				);
-			}
-		}
+		updateTitle();
 	}
 	
-	private boolean createLinkedDocument(Path file) {
+	private void applyHtmlAction(Action action) {
 
-		int choice = JOptionPane.showConfirmDialog(
-			window,
-			"Документ не найден:\n" +
-			file.getFileName() +
-			"\n\nСоздать новый документ?",
-			"Новая заметка",
-			JOptionPane.YES_NO_OPTION,
-			JOptionPane.QUESTION_MESSAGE
+		action.actionPerformed(
+			new ActionEvent(
+				notesArea,
+				ActionEvent.ACTION_PERFORMED,
+				"format"
+			)
 		);
 
-		if (choice != JOptionPane.YES_OPTION) {
-			return false;
-		}
-
-		try {
-			// Создаём пустой файл, не перезаписывая существующий
-			Files.createFile(file);
-			return true;
-
-		} catch (java.nio.file.FileAlreadyExistsException e) {
-			// Файл появился после проверки — используем его
-			return Files.isRegularFile(file);
-
-		} catch (IOException e) {
-			JOptionPane.showMessageDialog(
-				window,
-				"Ошибка создания файла:\n" + e.getMessage(),
-				"Ошибка",
-				JOptionPane.ERROR_MESSAGE
-			);
-			return false;
-		}
-	}
-	
-	private void openFile() {
-
-		JFileChooser chooser = new JFileChooser(notesFolder.toFile());
-
-		int result = chooser.showOpenDialog(window);
-
-		if (result == JFileChooser.APPROVE_OPTION) {
-
-			Path file = chooser.getSelectedFile().toPath();
-			
-			if (!confirmSaveChanges()) {
-				return;
-			}
-
-			try {
-				
-				
-				String text = Files.readString(file);
-
-				setDocumentText(text);
-				currentFile = file;
-
-				JOptionPane.showMessageDialog(
-					window,
-					"Файл успешно открыт!"
-				);
-				
-				String fileName = file.getFileName().toString();
-
-				if (fileName.toLowerCase(java.util.Locale.ROOT)
-						.endsWith(".txt")) {
-
-					fileName = fileName.substring(
-						0, fileName.length() - 4
-					);
-				}
-
-				nameField.setText(fileName);
-				saveSettings();
-				updateTitle();
-				
-			} catch (IOException e) {
-				JOptionPane.showMessageDialog(
-					window,
-					"Ошибка открытия: " + e.getMessage(),
-					"Ошибка",
-					JOptionPane.ERROR_MESSAGE
-				);
-			}
-		}
+		notesArea.requestFocusInWindow();
 	}
 
-	private void updateTitle() {
-
-		String title = "PlebHTE — ";
-
-		if (currentFile == null) {
-			title += "Новый документ";
-		} else {
-			title += currentFile.getFileName();
-		}
-
-		if (isModified) {
-			title += " *";
-		}
-
-		window.setTitle(title);
-	}
-	
-	private void openLinkAt(int position) {
-
-		String text = notesArea.getText();
-
-// Ищем конструкции вида [[Название]]
-		
-		Pattern pattern = Pattern.compile("\\[\\[([^\\[\\]\\r\\n]+)\\]\\]");
-		Matcher matcher = pattern.matcher(text);
-
-		while (matcher.find()) {
-
-// Проверяем, попал ли клик внутрь ссылки
-			
-			if (position >= matcher.start() &&
-				position < matcher.end()) {
-
-				String linkName = matcher.group(1).trim();
-
-				if (linkName.isEmpty()) {
-					return;
-				}
-
-				openLinkedDocument(linkName);
-				return;
-			}
-		}
-	}
-	
-		
-	private void openLinkedDocument(String name) {
-
-// Не разрешаем использовать ссылки как пути
-		
-		if (name.equals(".") || name.equals("..") ||
-			name.contains("/") || name.contains("\\") ||
-			name.indexOf('\0') >= 0) {
-
-			JOptionPane.showMessageDialog(
-				window, "Некорректное название ссылки!"
-			);
-			return;
-		}
-
-		String normalizedName = name.trim()
-				.toLowerCase(Locale.ROOT);
-
-		String fileName = normalizedName.endsWith(".txt")
-				? normalizedName
-				: normalizedName + ".txt";
-				
-		
-
-// Ищем ссылку рядом с текущим документом
-		
-		Path target = notesFolder.resolve(fileName);
-
-
-		if (!Files.isRegularFile(target)) {
-
-			// Если путь уже занят папкой или другим объектом
-			if (Files.exists(target)) {
-				JOptionPane.showMessageDialog(
-					window,
-					"По этому пути находится не обычный файл!"
-				);
-				return;
-			}
-
-			// Предлагаем создать документ
-			if (!createLinkedDocument(target)) {
-				return;
-			}
-		}
-
-		try {
-			String content = Files.readString(target);
-
-			if (!confirmSaveChanges()) {
-				return;
-			}
-
-			currentFile = target;
-			setDocumentText(content);
-
-// Отображаем имя без расширения
-			
-			String displayName =
-					target.getFileName().toString();
-
-			if (displayName.toLowerCase(
-					java.util.Locale.ROOT).endsWith(".txt")) {
-				displayName = displayName.substring(
-					0, displayName.length() - 4
-				);
-			}
-
-			nameField.setText(displayName);
-			updateTitle();
-			saveSettings();
-
-		} catch (IOException e) {
-			JOptionPane.showMessageDialog(
-				window,
-				"Ошибка открытия: " + e.getMessage(),
-				"Ошибка",
-				JOptionPane.ERROR_MESSAGE
-			);
-		}
-	}
-	
-	private boolean confirmSaveChanges() {
-
-		// Если ничего не изменялось,
-		// можно продолжать без вопросов
-		if (!isModified) {
-			return true;
-		}
-
-		String fileName = currentFile == null
-				? "Новый документ"
-				: currentFile.getFileName().toString();
-
-		Object[] options = {
-			"Сохранить",
-			"Не сохранять",
-			"Отмена"
-		};
-
-		int choice = JOptionPane.showOptionDialog(
-			window,
-			"В документе \"" + fileName +
-			"\" есть несохранённые изменения.\n" +
-			"Сохранить перед продолжением?",
-			"Несохранённые изменения",
-			JOptionPane.DEFAULT_OPTION,
-			JOptionPane.WARNING_MESSAGE,
-			null,
-			options,
-			options[0]
-		);
-
-		if (choice == 0) {
-			// Сохранить и продолжить,
-			// только если запись успешна
-			return saveToFile();
-		}
-
-		if (choice == 1) {
-			// Продолжить без сохранения
-			return true;
-		}
-
-		// Отмена или закрытие диалога
-		return false;
-	}
-	
-	
-	private void highlightChangedLines(int start, int end) {
-
-		StyledDocument doc = notesArea.getStyledDocument();
-		int length = doc.getLength();
-
-		if (length == 0) {
-			return;
-		}
-
-		// Не позволяем выйти за границы документа
-		start = Math.max(0, Math.min(start, length));
-		end = Math.max(start, Math.min(end, length));
-
-		// Находим логические строки изменённого участка
-		Element root = doc.getDefaultRootElement();
-
-		int firstLine = root.getElementIndex(start);
-		int lastLine = root.getElementIndex(end);
-
-		int from = root.getElement(firstLine).getStartOffset();
-		int to = Math.min(
-			root.getElement(lastLine).getEndOffset(),
-			length
-		);
-
-		// Читаем только нужный фрагмент
-		String text;
-
-		try {
-			text = doc.getText(from, to - from);
-		} catch (BadLocationException e) {
-			return;
-		}
-
-		// Стиль обычного текста
-		SimpleAttributeSet normal = new SimpleAttributeSet();
-
-		StyleConstants.setForeground(
-			normal,
-			darkThemeCheck.isSelected()
-				? Color.WHITE : Color.BLACK
-		);
-
-		StyleConstants.setUnderline(normal, false);
-
-		// Стиль ссылки
-		SimpleAttributeSet link = new SimpleAttributeSet();
-
-		StyleConstants.setForeground(
-			link, new Color(65, 145, 245)
-		);
-
-		StyleConstants.setUnderline(link, true);
-
-		// Сбрасываем подсветку только нужных строк
-		doc.setCharacterAttributes(
-			from, to - from, normal, false
-		);
-
-		Matcher matcher = LINK_PATTERN.matcher(text);
-
-		while (matcher.find()) {
-			doc.setCharacterAttributes(
-				from + matcher.start(),
-				matcher.end() - matcher.start(),
-				link,
-				false
-			);
-		}
-	}
-
-
-	private void highlightLinks() {
-		highlightChangedLines(
-			0,
-			notesArea.getDocument().getLength()
-		);
-	}
-	
 	private void markModified() {
 
 		if (isLoading) {
@@ -878,54 +283,333 @@ public class PlebHTE {
 		}
 	}
 
-
-    private void applyTheme(boolean dark) {
-        Color background = dark
-                ? new Color(45, 45, 45) : new Color(245, 245, 245);
-
-        Color foreground = dark
-                ? Color.WHITE : Color.BLACK;
-
-        Color inputBackground = dark
-                ? new Color(60, 60, 60) : Color.WHITE;
-
-        Container root = window.getContentPane();
-
-        applyColors(root, background, foreground);
-
-        nameField.setBackground(inputBackground);
-        notesArea.setBackground(inputBackground);
-
-        nameField.setForeground(foreground);
-        notesArea.setForeground(foreground);
-        notesArea.setCaretColor(foreground);
-
-        root.repaint();
-        highlightLinks();
+    private void updateTitle() {
+        String fileName = currentFile == null ? "New document" : currentFile.getFileName().toString();
+        window.setTitle("PlebHTE — " + fileName + (isModified ? " *" : ""));
     }
 
-    private void applyColors(
-            Component component, Color bg, Color fg) {
+    private boolean confirmSaveChanges() {
+        if (!isModified) return true;
+        Object[] options = {"Save", "Don't save", "Cancel"};
+        int answer = JOptionPane.showOptionDialog(window,
+                "There are unsaved changes. Save before continuing?",
+                "Unsaved changes", JOptionPane.DEFAULT_OPTION,
+                JOptionPane.WARNING_MESSAGE, null, options, options[0]);
+        if (answer == 0) return saveToFile();
+        return answer == 1;
+    }
 
-        if (component instanceof JPanel) {
-            component.setBackground(bg);
+    private String normalizeHtmlName(String name) {
+        name = name.trim().toLowerCase(Locale.ROOT);
+        if (name.endsWith(".html")) name = name.substring(0, name.length() - 5);
+        else if (name.endsWith(".txt")) name = name.substring(0, name.length() - 4);
+        if (name.isEmpty() || name.equals(".") || name.equals("..") ||
+                name.contains("/") || name.contains("\\") || name.indexOf('\0') >= 0) {
+            return null;
         }
+        return name + ".html";
+    }
 
-        if (component instanceof JLabel
-                || component instanceof JCheckBox) {
-            component.setForeground(fg);
+    private String displayName(Path path) {
+        String name = path.getFileName().toString();
+        String lower = name.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".html")) return name.substring(0, name.length() - 5);
+        if (lower.endsWith(".txt")) return name.substring(0, name.length() - 4);
+        return name;
+    }
+
+    private boolean confirmOverwrite(Path file) {
+        if (!Files.exists(file)) return true;
+        if (currentFile != null && file.toAbsolutePath().normalize()
+                .equals(currentFile.toAbsolutePath().normalize())) return true;
+        int answer = JOptionPane.showConfirmDialog(window,
+                "Overwrite existing file?\n" + file,
+                "Confirm overwrite", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        return answer == JOptionPane.YES_OPTION;
+    }
+
+    private boolean saveToFile() {
+        String fileName = normalizeHtmlName(nameField.getText());
+        if (fileName == null) {
+            JOptionPane.showMessageDialog(window, "Enter a valid note name.");
+            return false;
         }
+        Path file = currentFile == null
+                ? notesFolder.resolve(fileName)
+                : currentFile.resolveSibling(fileName);
+        return saveDocument(file);
+    }
 
-        if (component instanceof JCheckBox) {
-            component.setBackground(bg);
+    private boolean saveAsFile() {
+        JFileChooser chooser = new JFileChooser(notesFolder.toFile());
+        String suggested = normalizeHtmlName(nameField.getText());
+        if (suggested == null) suggested = "notes.html";
+        Path suggestedPath = currentFile == null
+                ? notesFolder.resolve(suggested) : currentFile.resolveSibling(suggested);
+        chooser.setSelectedFile(suggestedPath.toFile());
+        if (chooser.showSaveDialog(window) != JFileChooser.APPROVE_OPTION) return false;
+
+        Path chosen = chooser.getSelectedFile().toPath();
+        String name = normalizeHtmlName(chosen.getFileName().toString());
+        if (name == null) {
+            JOptionPane.showMessageDialog(window, "Invalid file name.");
+            return false;
         }
+        return saveDocument(chosen.resolveSibling(name));
+    }
 
-        if (component instanceof Container) {
-            for (Component child :
-                    ((Container) component).getComponents()) {
-                applyColors(child, bg, fg);
+    private boolean saveDocument(Path file) {
+        if (!confirmOverwrite(file)) return false;
+        try {
+            HTMLEditorKit kit = (HTMLEditorKit) notesArea.getEditorKit();
+            HTMLDocument doc = (HTMLDocument) notesArea.getDocument();
+            StringWriter out = new StringWriter();
+            kit.write(out, doc, 0, doc.getLength());
+            // Write to a temporary file first, then replace the destination.
+            // This prevents a failed write from truncating an existing note.
+            Path temp = Files.createTempFile(file.toAbsolutePath().getParent(),
+                    ".plebhte-", ".tmp");
+            try {
+                Files.writeString(temp, out.toString(), StandardCharsets.UTF_8);
+                try {
+                    Files.move(temp, file,
+                            StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException ex) {
+                    Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
+                }
+            } finally {
+                Files.deleteIfExists(temp);
+            }
+        } catch (IOException | BadLocationException e) {
+            showError("Cannot save HTML", e);
+            return false;
+        }
+        currentFile = file;
+        nameField.setText(displayName(file));
+        isModified = false;
+        saveSettings();
+        updateTitle();
+        return true;
+    }
+
+    private String readDocument(Path file) throws IOException {
+        String content = Files.readString(file, StandardCharsets.UTF_8);
+        String lower = file.getFileName().toString().toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".html") || lower.endsWith(".htm")) return content;
+// Take old notes as a text
+        String escaped = content.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;");
+        return "<html><body><pre>" + escaped + "</pre></body></html>";
+    }
+
+    private void openDocument(Path file, boolean checkUnsaved) {
+        String html;
+        try {
+            html = readDocument(file);
+        } catch (IOException e) {
+            showError("Cannot open document", e);
+            return;
+        }
+        if (checkUnsaved && !confirmSaveChanges()) return;
+        currentFile = file;
+        setDocumentText(html);
+        nameField.setText(displayName(file));
+        saveSettings();
+        updateTitle();
+    }
+
+    private void openFile() {
+        JFileChooser chooser = new JFileChooser(notesFolder.toFile());
+        if (chooser.showOpenDialog(window) == JFileChooser.APPROVE_OPTION) {
+            openDocument(chooser.getSelectedFile().toPath(), true);
+        }
+    }
+
+    private void openLinkAt(int position) {
+        try {
+            String text = notesArea.getDocument().getText(0, notesArea.getDocument().getLength());
+            Matcher matcher = LINK_PATTERN.matcher(text);
+            while (matcher.find()) {
+                if (position >= matcher.start() && position < matcher.end()) {
+                    openLinkedDocument(matcher.group(1).trim());
+                    return;
+                }
+            }
+        } catch (BadLocationException e) {
+            showError("Cannot read link", e);
+        }
+    }
+
+    private void openLinkedDocument(String link) {
+        String fileName = normalizeHtmlName(link);
+        if (fileName == null) {
+            JOptionPane.showMessageDialog(window, "Invalid link name.");
+            return;
+        }
+        Path htmlFile = notesFolder.resolve(fileName);
+        Path target = htmlFile;
+        if (!Files.exists(htmlFile)) {
+            String base = fileName.substring(0, fileName.length() - 5);
+            Path txt = notesFolder.resolve(base + ".txt");
+            if (Files.isRegularFile(txt)) target = txt;
+        }
+        if (Files.exists(target) && !Files.isRegularFile(target)) {
+            JOptionPane.showMessageDialog(window, "This path is not a regular file.");
+            return;
+        }
+        if (Files.isRegularFile(target)) {
+            openDocument(target, true);
+            return;
+        }
+        if (!confirmSaveChanges()) return;
+        int answer = JOptionPane.showConfirmDialog(window,
+                "Create document " + htmlFile.getFileName() + "?",
+                "New note", JOptionPane.YES_NO_OPTION);
+        if (answer != JOptionPane.YES_OPTION) return;
+        try {
+            Files.createFile(htmlFile);
+        } catch (FileAlreadyExistsException e) {
+            if (Files.isRegularFile(htmlFile)) {
+                openDocument(htmlFile, false);
+            } else {
+                showError("Cannot create document", e);
+            }
+            return;
+        } catch (IOException e) {
+            showError("Cannot create document", e);
+            return;
+        }
+        currentFile = htmlFile;
+        setDocumentText(EMPTY_HTML);
+        nameField.setText(displayName(htmlFile));
+        saveSettings();
+    }
+
+    private void saveSettings() {
+        prefs.put("name", nameField.getText());
+        prefs.putBoolean("darkTheme", darkThemeCheck.isSelected());
+        if (currentFile != null) {
+            prefs.put("lastFile", currentFile.toAbsolutePath().toString());
+        }
+    }
+
+    private void loadSettings() {
+        nameField.setText(prefs.get("name", ""));
+        boolean dark = prefs.getBoolean("darkTheme", false);
+        darkThemeCheck.setSelected(dark);
+        applyTheme(dark);
+        String last = prefs.get("lastFile", "");
+        if (!last.isEmpty()) {
+            try {
+                Path file = Path.of(last);
+                if (Files.isRegularFile(file)) openDocument(file, false);
+            } catch (InvalidPathException e) {
+                showError("Invalid last document path", e);
             }
         }
     }
+
+    private void applyTheme(boolean dark) {
+        Color bg = dark ? new Color(45, 45, 45) : new Color(245, 245, 245);
+        Color fg = dark ? Color.WHITE : Color.BLACK;
+        Color inputBg = dark ? new Color(60, 60, 60) : Color.WHITE;
+        applyColors(window.getContentPane(), bg, fg);
+        nameField.setBackground(inputBg);
+//        notesArea.setBackground(inputBg);
+        nameField.setForeground(fg);
+//        notesArea.setForeground(fg);
+//        notesArea.setCaretColor(fg);
+
+        window.repaint();
+    }
+
+    private void applyColors(Component c, Color bg, Color fg) {
+        if (c instanceof JPanel) c.setBackground(bg);
+        if (c instanceof JLabel || c instanceof JCheckBox) c.setForeground(fg);
+        if (c instanceof JCheckBox) c.setBackground(bg);
+        if (c instanceof Container) {
+            for (Component child : ((Container) c).getComponents()) applyColors(child, bg, fg);
+        }
+    }
+    
+    private void setupFormattingShortcuts() {
+
+		InputMap input = notesArea.getInputMap();
+		ActionMap actions = notesArea.getActionMap();
+
+		input.put(
+			KeyStroke.getKeyStroke("control B"),
+			"font-bold"
+		);
+
+		input.put(
+			KeyStroke.getKeyStroke("control I"),
+			"font-italic"
+		);
+
+		input.put(
+			KeyStroke.getKeyStroke("control U"),
+			"font-underline"
+		);
+
+		actions.put(
+			"font-bold",
+			new HTMLEditorKit.BoldAction()
+		);
+
+		actions.put(
+			"font-italic",
+			new HTMLEditorKit.ItalicAction()
+		);
+
+		actions.put(
+			"font-underline",
+			new HTMLEditorKit.UnderlineAction()
+		);
+	}
+    
+    
+
+private void highlightWikiLinks() {
+
+    Highlighter highlighter = notesArea.getHighlighter();
+
+    // Remove only old link hilights
+    for (Object tag : wikiHighlights) {
+        highlighter.removeHighlight(tag);
+    }
+
+    wikiHighlights.clear();
+
+    try {
+        String text = notesArea.getDocument().getText(
+            0,
+            notesArea.getDocument().getLength()
+        );
+
+        Matcher matcher = LINK_PATTERN.matcher(text);
+
+        while (matcher.find()) {
+
+            Object tag = highlighter.addHighlight(
+                matcher.start(),
+                matcher.end(),
+                wikiPainter
+            );
+
+            wikiHighlights.add(tag);
+        }
+
+    } catch (BadLocationException e) {
+        // Highlights shouldn't mess the editing
+    }
 }
 
+
+
+    private void showError(String message, Exception e) {
+        JOptionPane.showMessageDialog(window, message + ":\n" + e.getMessage(),
+                "Error", JOptionPane.ERROR_MESSAGE);
+    }
+}
