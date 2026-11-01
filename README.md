@@ -8,6 +8,7 @@ Installation (Debian family):
   1. run plebhte_1.0.0-1_all.deb
 
 Installation (java):
+
   0.(if java do not exist or old) sudo apt install openjdk-21-jre
   1. java -jar PlebHTE.jar
 
