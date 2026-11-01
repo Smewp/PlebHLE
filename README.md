@@ -1,3 +1,5 @@
+
+
 lebHTE 1.0 — Linux + Java 21 // JAR
 ==================================
 Installation (Debian family):
@@ -8,8 +10,6 @@ Installation (Debian family):
 Installation (java):
   0.(if java do not exist or old) sudo apt install openjdk-21-jre
   1. java -jar PlebHTE.jar
-
-
 
 
 Requirements:
@@ -26,6 +26,10 @@ Data:
 Uninstall:
   sudo apt remove plebhte (for debian installers)
   The uninstall script deliberately keeps all your notes and preferences.
+
+
+<img width="550" height="400" alt="PlebHTE" src="https://github.com/user-attachments/assets/8e6e621d-adcd-415c-a249-4f8ac2c975a5" />
+
 
 Features:
   HTML visual editor; 
