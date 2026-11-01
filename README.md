@@ -9,7 +9,7 @@ Installation (Debian family):
 
 Installation (java):
 
-  1. (if java do not exist or old) sudo apt install openjdk-21-jre
+  1. (if java do not exist or old) install openjdk 21 or later
   2. java -jar PlebHTE.jar
 
 
