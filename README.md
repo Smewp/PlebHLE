@@ -1,4 +1,4 @@
-lebHTE 1.0 — Linux Mint / Java 21
+lebHTE 1.0 — Linux + Java 21 // JAR
 ==================================
 Installation (Debian family):
 
